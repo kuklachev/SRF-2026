@@ -1,0 +1,508 @@
+openapi: 3.0.3
+info:
+  title: Вертикаль — API клиентского мобильного приложения
+  version: 0.1.0-mvp
+  description: |
+    API для клиентского мобильного приложения скалодрома «Вертикаль» (MVP).
+
+    Скоуп ограничен ролью **Клиент**: просмотр расписания тренировок, запись,
+    просмотр и отмена собственных бронирований, оценка инструктора.
+    Управление расписанием, тренировками и инструкторами выполняется
+    существующей административной системой и в этот контракт не входит —
+    соответствующие ресурсы (`Training`, `Instructor`) доступны клиенту
+    **только на чтение**.
+
+    Источники: business-requirements.md (BR), functional-requirements.md (FR),
+    non-functional-requirements.md (NFR), use-cases.md (UC), user-stories.md (US),
+    data-model.md, api-sequence.md, реестр экранов 00-screens-registry.md и
+    постановки SCR-1…SCR-9.
+
+    ## Открытые вопросы (не закрыты требованиями, см. `x-open-questions`)
+    - Механизм регистрации/авторизации клиента не описан ни в одном из
+      предоставленных документов (use-cases.md прямо фиксирует: «регистрация
+      пользователя — нет FR-описания»). Эндпоинты `/auth/*` в этой версии
+      спецификации **не определены** — раздел `securitySchemes` предполагает
+      готовый bearer-токен, источник которого нужно уточнить у заказчика.
+    - Итоговый набор фильтров расписания (02-schedule-filters.md) и порядок
+      расчёта стоимости брони на нескольких участников (04-booking-form.md)
+      не зафиксированы в требованиях — заложены наиболее вероятные варианты,
+      требуют подтверждения перед реализацией.
+    - Выбор оборудования на уровне брони целиком, а не по каждому участнику —
+      решение, принятое в data-model.md на основании формулировки domain
+      («полный комплект»); помечено как открытое допущение.
+  contact:
+    name: Аналитика проекта «Вертикаль»
+
+servers:
+  - url: https://api.vertical-climbing.example/v1
+    description: Плейсхолдер — реальный базовый URL уточняется на этапе релиза
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: trainings
+    description: Просмотр расписания тренировок (read-only, источник — существующий backend)
+  - name: bookings
+    description: Создание, просмотр и отмена бронирований клиента
+  - name: ratings
+    description: Оценка инструктора после завершения тренировки
+
+paths:
+  /trainings:
+    get:
+      tags: [trainings]
+      summary: Список доступных тренировок
+      description: |
+        Реализует UC-1 (SCR-1) и UC-3 (SCR-2 — фильтрация). Возвращает
+        тренировки, отдаваемые существующим backend как единственным
+        источником истины (BR-11, NFR-6).
+      operationId: listTrainings
+      parameters:
+        - name: date_from
+          in: query
+          description: Начало диапазона дат (включительно)
+          schema: { type: string, format: date }
+        - name: date_to
+          in: query
+          description: Конец диапазона дат (включительно)
+          schema: { type: string, format: date }
+        - name: format
+          in: query
+          description: Фильтр по формату тренировки
+          schema: { $ref: '#/components/schemas/TrainingFormat' }
+        - name: instructor_id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: only_available
+          in: query
+          description: Показывать только тренировки со свободными местами (free_seats > 0)
+          schema: { type: boolean, default: false }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        '200':
+          description: Список тренировок, соответствующих фильтрам
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Training' }
+                  total:
+                    type: integer
+                required: [items, total]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '5XX': { $ref: '#/components/responses/ServerError' }
+      x-open-questions:
+        - "Точный набор фильтров (время суток, диапазон и т.п.) не зафиксирован в 02-schedule-filters.md — согласовать с заказчиком до реализации."
+
+  /trainings/{trainingId}:
+    get:
+      tags: [trainings]
+      summary: Подробная информация о тренировке
+      description: Реализует UC-2 (SCR-3). Тренировка может быть в статусе `cancelled` — экран обязан это отразить (FR-19).
+      operationId: getTraining
+      parameters:
+        - $ref: '#/components/parameters/TrainingId'
+      responses:
+        '200':
+          description: Подробные данные о тренировке
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Training' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '5XX': { $ref: '#/components/responses/ServerError' }
+
+  /bookings:
+    get:
+      tags: [bookings]
+      summary: Список бронирований клиента
+      description: |
+        Реализует UC-5 (SCR-6). Возвращает только собственные бронирования
+        авторизованного клиента (NFR-9).
+      operationId: listBookings
+      parameters:
+        - name: status
+          in: query
+          description: Фильтр по статусу брони
+          schema: { $ref: '#/components/schemas/BookingStatus' }
+        - name: upcoming
+          in: query
+          description: |
+            true — только предстоящие тренировки (training.start_at в будущем),
+            false — только прошедшие. Если параметр не передан — возвращаются все.
+          schema: { type: boolean }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        '200':
+          description: Список бронирований клиента
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Booking' }
+                  total:
+                    type: integer
+                required: [items, total]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '5XX': { $ref: '#/components/responses/ServerError' }
+
+    post:
+      tags: [bookings]
+      summary: Создать бронь на тренировку
+      description: |
+        Реализует UC-4 (SCR-4 → SCR-5). Соответствует сценарию `createBooking`
+        из api-sequence.md: проверка мест/статуса тренировки и создание брони
+        выполняются атомарно на стороне backend (BR-1, NFR-3, NFR-4).
+      operationId: createBooking
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BookingCreateRequest' }
+      responses:
+        '201':
+          description: Бронь успешно создана (см. api-sequence.md → ветка 201)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Booking' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409':
+          description: |
+            Недостаточно свободных мест или прокатных комплектов на момент
+            атомарной проверки (в т.ч. при гонке с параллельной записью) —
+            см. api-sequence.md → ветка 409.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BookingConflictError' }
+        '410':
+          description: |
+            Тренировка уже отменена скалодромом (`training.status = cancelled`)
+            — см. api-sequence.md → ветка 410 и FR-19.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '5XX': { $ref: '#/components/responses/ServerError' }
+      x-open-questions:
+        - "Порядок расчёта итоговой стоимости брони при нескольких участниках не описан в требованиях (04-booking-form.md) — предполагается price × participants_count, требует подтверждения."
+        - "Выбор оборудования зафиксирован на уровне брони целиком, а не по каждому участнику — уточнить при необходимости раздельного выбора."
+
+  /bookings/{bookingId}:
+    get:
+      tags: [bookings]
+      summary: Детали бронирования
+      description: Реализует SCR-7 (первая часть — просмотр деталей перед отменой).
+      operationId: getBooking
+      parameters:
+        - $ref: '#/components/parameters/BookingId'
+      responses:
+        '200':
+          description: Детали брони
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Booking' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '5XX': { $ref: '#/components/responses/ServerError' }
+
+  /bookings/{bookingId}/cancel:
+    post:
+      tags: [bookings]
+      summary: Отменить бронирование
+      description: |
+        Реализует UC-6 (SCR-7). Тип отмены (`cancelled` / `late_cancel`)
+        определяет backend по времени до `training.start_at` (источник
+        истины — сервер, NFR-6); граница ровно 2 часа трактуется как ранняя
+        отмена (FR-14). Отмена — терминальный переход, повторная отмена
+        невозможна (см. data-model.md → «Модель состояний»).
+      operationId: cancelBooking
+      parameters:
+        - $ref: '#/components/parameters/BookingId'
+      responses:
+        '200':
+          description: Бронь отменена (статус `cancelled` либо `late_cancel`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Booking' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Бронь уже находится в терминальном статусе (повторная отмена)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: Тренировка уже началась — отмена недоступна (UC-6)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '5XX': { $ref: '#/components/responses/ServerError' }
+
+  /bookings/{bookingId}/rating:
+    post:
+      tags: [ratings]
+      summary: Оценить инструктора по завершённой тренировке
+      description: |
+        Реализует UC-8 (SCR-9), Should-требование BR-10. Доступно только для
+        `booking.status = active` тренировок, которые уже завершились
+        (`training.start_at + duration_min` в прошлом) — FR-22. Одна оценка
+        на одну бронь.
+      operationId: createRating
+      parameters:
+        - $ref: '#/components/parameters/BookingId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RatingCreateRequest' }
+      responses:
+        '201':
+          description: Оценка сохранена
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Rating' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Оценка по этой брони уже оставлена
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: |
+            Тренировка ещё не завершена, либо бронь не в статусе `active`
+            (UC-8, альтернативный сценарий «тренировка не завершена → оценка недоступна»)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '5XX': { $ref: '#/components/responses/ServerError' }
+      x-open-questions:
+        - "Возможность редактирования уже поставленной оценки не описана в требованиях (09-instructor-rating.md) — в этой версии считается недоступной."
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Токен клиента. Протокол получения токена (регистрация/вход) не
+        зафиксирован в требованиях — см. `x-open-questions` в info.description
+        и 00-screens-registry.md → «Экраны вне текущей проработки».
+
+  parameters:
+    TrainingId:
+      name: trainingId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    BookingId:
+      name: bookingId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  schemas:
+    TrainingFormat:
+      type: string
+      enum: [novice, experienced]
+      description: "novice — для новичков (вместимость ≤ 8), experienced — для опытных (вместимость ≤ 16)"
+
+    TrainingStatus:
+      type: string
+      enum: [scheduled, cancelled]
+      description: "cancelled — тренировка отменена скалодромом (read-only для клиента, FR-17–FR-19)"
+
+    EquipmentType:
+      type: string
+      enum: [own, rental]
+      description: "own — собственное оборудование, rental — полный прокатный комплект скалодрома на бронь целиком"
+
+    BookingStatus:
+      type: string
+      enum: [active, cancelled, late_cancel, club_cancelled]
+      description: |
+        active — подтверждена; cancelled — отменена клиентом заранее (≥ 2 ч);
+        late_cancel — отменена клиентом менее чем за 2 ч (без штрафа);
+        club_cancelled — тренировка отменена скалодромом (FR-18)
+
+    PaymentStatus:
+      type: string
+      enum: [unpaid, paid]
+      description: Статус офлайн-оплаты; выставляется персоналом скалодрома, клиентское приложение только отображает (BR-13)
+
+    Instructor:
+      type: object
+      description: Read-only справочная информация об инструкторе (NFR-14)
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        avatar_url:
+          type: string
+          format: uri
+          nullable: true
+          description: |
+            Поле упомянуто в 03-training-details.md («имя, фото»), но
+            отсутствует в data-model.md — добавлено как вероятное расширение,
+            требует подтверждения источника (фото инструктора) у backend-команды.
+      required: [id, name]
+
+    Training:
+      type: object
+      description: |
+        Read-only ресурс (🔒 в data-model.md). Создаётся и изменяется
+        существующей административной системой; клиентское приложение
+        только читает (BR-11, NFR-14).
+      properties:
+        id: { type: string, format: uuid }
+        start_at: { type: string, format: date-time, description: "UTC; клиент отображает в локальной таймзоне скалодрома" }
+        duration_min: { type: integer, example: 90 }
+        format: { $ref: '#/components/schemas/TrainingFormat' }
+        instructor: { $ref: '#/components/schemas/Instructor' }
+        price: { type: number, format: double, description: "Цена за одно место, RUB" }
+        total_seats: { type: integer }
+        free_seats: { type: integer }
+        free_rental_kits:
+          type: integer
+          nullable: true
+          description: |
+            Доступность прокатных комплектов (FR-9). Точный числовой лимит
+            прокатного фонда не зафиксирован в требованиях — см.
+            data-model.md → допущение.
+        status: { $ref: '#/components/schemas/TrainingStatus' }
+      required: [id, start_at, duration_min, format, instructor, price, total_seats, free_seats, status]
+
+    BookingCreateRequest:
+      type: object
+      properties:
+        training_id: { type: string, format: uuid }
+        participants_count:
+          type: integer
+          minimum: 1
+          maximum: 3
+          description: "Клиент + до двух гостей (BR-7, FR-7)"
+        equipment_type: { $ref: '#/components/schemas/EquipmentType' }
+      required: [training_id, participants_count, equipment_type]
+
+    Booking:
+      type: object
+      description: Mutable-ресурс (✏️ в data-model.md), управляется клиентским API
+      properties:
+        id: { type: string, format: uuid }
+        training: { $ref: '#/components/schemas/Training' }
+        participants_count: { type: integer, minimum: 1, maximum: 3 }
+        equipment_type: { $ref: '#/components/schemas/EquipmentType' }
+        status: { $ref: '#/components/schemas/BookingStatus' }
+        payment_status: { $ref: '#/components/schemas/PaymentStatus' }
+        has_rating:
+          type: boolean
+          description: |
+            Производное поле: указывает, оставлена ли уже оценка инструктору
+            по этой брони — используется, чтобы SCR-6 показывал CTA «Оценить»
+            только когда это уместно (FR-22).
+        created_at: { type: string, format: date-time }
+        cancelled_at: { type: string, format: date-time, nullable: true }
+      required: [id, training, participants_count, equipment_type, status, payment_status, has_rating, created_at]
+
+    RatingCreateRequest:
+      type: object
+      properties:
+        score:
+          type: integer
+          minimum: 1
+          maximum: 5
+        comment:
+          type: string
+          nullable: true
+          maxLength: 2000
+      required: [score]
+
+    Rating:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        booking_id: { type: string, format: uuid }
+        instructor_id: { type: string, format: uuid }
+        score: { type: integer, minimum: 1, maximum: 5 }
+        comment: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+      required: [id, booking_id, instructor_id, score, created_at]
+
+    Error:
+      type: object
+      properties:
+        code: { type: string, example: "training_cancelled" }
+        message: { type: string }
+        details:
+          type: object
+          additionalProperties: true
+          nullable: true
+      required: [code, message]
+
+    BookingConflictError:
+      allOf:
+        - $ref: '#/components/schemas/Error'
+        - type: object
+          properties:
+            code:
+              type: string
+              enum: [slot_full, rental_unavailable]
+            details:
+              type: object
+              properties:
+                free_seats: { type: integer }
+                free_rental_kits: { type: integer, nullable: true }
+
+  responses:
+    BadRequest:
+      description: Невалидные данные запроса
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: Токен отсутствует/истёк — клиент направляется на экран входа
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: Ресурс принадлежит другому клиенту (NFR-9)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Ресурс не найден
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    UnprocessableEntity:
+      description: Семантически некорректный запрос (например, participants_count вне диапазона 1..3)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ServerError:
+      description: Сетевая или серверная ошибка / таймаут
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
